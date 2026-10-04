@@ -8,13 +8,17 @@
 - 同组内新增关系（闭环）必须符合已有位姿；
 - 任何校验失败整次拒绝，原拼接组不变；
 - 撤销关系后按剩余关系重算连通组，孤片恢复独立状态；
-- 采纳/撤销携带期望版本号，过期版本返回 409 冲突。
+- 采纳/撤销携带期望版本号，过期版本返回 409 冲突；
+- 试拼编排：基于当前版本快照对非空有序序列（撤销 / 建立关系）只读逐步推演，
+  返回每步结果与最终位姿分组或首个失败原因；确认按同一版本与序列整体提交，
+  任一步失败或版本过期不写入，成功仅递增一次版本。
 """
 from __future__ import annotations
 
 import math
 import os
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import geometry
 from .database import DB
+from .rehearsal import StepError, evaluate_proposal, run_rehearsal
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get(
@@ -58,11 +63,27 @@ class UndoIn(BaseModel):
     expected_version: int
 
 
+# ----------------------------------------------------- 试拼编排（多步序列）
+
+class RehearsalUndoStep(BaseModel):
+    action: Literal["undo"] = "undo"
+    relation_id: int
+
+
+class RehearsalCreateStep(BaseModel):
+    action: Literal["create"] = "create"
+    fragment_a: int
+    fragment_b: int
+    markers_a: list[list[float]] = Field(default_factory=list)
+    markers_b: list[list[float]] = Field(default_factory=list)
+
+
+class RehearsalIn(BaseModel):
+    expected_version: int
+    steps: list[RehearsalUndoStep | RehearsalCreateStep]
+
+
 # ---------------------------------------------------------------- 拼接演算
-
-def _pose_of(f: dict) -> tuple[float, float, float]:
-    return (f["x"], f["y"], f["theta"])
-
 
 def _load_pair(d: DB, fa_id: int, fb_id: int):
     if fa_id == fb_id:
@@ -72,88 +93,6 @@ def _load_pair(d: DB, fa_id: int, fb_id: int):
         missing = fa_id if fa is None else fb_id
         raise HTTPException(404, f"碎片 #{missing} 不存在")
     return fa, fb
-
-
-def _members(d: DB, frag: dict) -> list[dict]:
-    """碎片所在组的全部成员（孤片即自身）。"""
-    if frag["group_id"] is None:
-        return [frag]
-    return d.group_members(frag["group_id"])
-
-
-def evaluate_proposal(d: DB, fa: dict, fb: dict,
-                      markers_a, markers_b) -> dict:
-    """计算采纳后的位姿方案（只读，不落库），供预览与采纳共用。"""
-    try:
-        ma, mb = geometry.validate_markers(markers_a, markers_b)
-    except geometry.GeometryError as e:
-        return {"ok": False, "relation_type": None, "conflicts": [str(e)],
-                "errors": [], "poses": {}, "new_poses": {}, "involved": [],
-                "markers": (markers_a, markers_b)}
-
-    members_a, members_b = _members(d, fa), _members(d, fb)
-    ga, gb = fa["group_id"], fb["group_id"]
-    pose_a, pose_b = _pose_of(fa), _pose_of(fb)
-    new_poses: dict[int, tuple] = {}
-
-    if ga is not None and ga == gb:
-        # 闭环关系：必须符合已有位姿，不移动任何碎片
-        relation_type = "loop"
-        involved = {f["id"] for f in members_a}
-    else:
-        dst = [geometry.apply_pose(m, pose_a) for m in ma]  # A 侧标记的世界坐标
-        if ga is None and gb is None:
-            relation_type = "new_group"
-            new_poses[fb["id"]] = geometry.fit_rigid(mb, dst)
-        elif ga is not None and gb is None:
-            relation_type = "join"
-            new_poses[fb["id"]] = geometry.fit_rigid(mb, dst)
-        elif ga is None and gb is not None:
-            relation_type = "join"
-            src_b = [geometry.apply_pose(m, pose_b) for m in mb]
-            new_poses[fa["id"]] = geometry.fit_rigid(ma, src_b)
-        else:
-            # 合并两组：整体移动 B 组，组内相对位姿不变
-            relation_type = "merge"
-            src_b = [geometry.apply_pose(m, pose_b) for m in mb]
-            T = geometry.fit_rigid(src_b, dst)
-            for f in members_b:
-                new_poses[f["id"]] = geometry.compose_pose(T, _pose_of(f))
-        involved = {f["id"] for f in members_a} | {f["id"] for f in members_b}
-
-    # 采纳后的最终位姿 = 当前位姿 + 本次改动
-    by_id = {f["id"]: f for f in members_a + members_b}
-    poses = {fid: _pose_of(f) for fid, f in by_id.items()}
-    poses.update(new_poses)
-
-    conflicts: list[str] = []
-    errors = geometry.pair_errors(ma, mb, poses[fa["id"]], poses[fb["id"]])
-    for i, e in enumerate(errors):
-        if e > geometry.MAX_ERROR_MM + 1e-9:
-            conflicts.append(
-                f"误差超限：第 {i + 1} 对对应点误差 {e:.3f} mm，"
-                f"超过 {geometry.MAX_ERROR_MM:.0f} mm 限值")
-
-    placed = [
-        (fid, by_id[fid]["name"],
-         geometry.contour_world(by_id[fid]["contour"], poses[fid]))
-        for fid in sorted(involved)
-    ]
-    for n1, n2, area in geometry.find_overlaps(placed):
-        conflicts.append(
-            f"碰撞：碎片「{n1}」与「{n2}」轮廓内部重叠 {area:.2f} mm²")
-
-    return {
-        "ok": not conflicts,
-        "relation_type": relation_type,
-        "conflicts": conflicts,
-        "errors": errors,
-        "poses": poses,
-        "new_poses": new_poses,
-        "involved": sorted(involved),
-        "by_id": by_id,
-        "markers": (ma, mb),
-    }
 
 
 def _check_version(d: DB, expected: int):
@@ -345,6 +284,135 @@ def list_relations():
 def get_assembly():
     """当前装配快照：版本号、碎片位姿、连通组、全部关系。"""
     return get_db().assembly_state()
+
+
+# ------------------------------------------------------------ 试拼编排 API
+
+def _step_http_status(code: str) -> int:
+    return {"not_found": 404, "invalid_markers": 400, "conflict": 400}.get(
+        code, 400)
+
+
+def _steps_payload(payload: RehearsalIn) -> list[dict]:
+    """Pydantic 联合模型 → 纯 dict 序列（丢弃字面量以外的多余字段）。"""
+    steps: list[dict] = []
+    for s in payload.steps:
+        if s.action == "undo":
+            steps.append({"action": "undo", "relation_id": s.relation_id})
+        else:
+            steps.append({
+                "action": "create",
+                "fragment_a": s.fragment_a,
+                "fragment_b": s.fragment_b,
+                "markers_a": s.markers_a,
+                "markers_b": s.markers_b,
+            })
+    return steps
+
+
+def _rehearsal_body(snapshot: dict, steps: list[dict], base_version: int) -> dict:
+    result = run_rehearsal(snapshot, steps)
+    body = {
+        "ok": result["ok"],
+        "base_version": base_version,
+        "steps": result["steps"],
+        "failed_at": result["failed_at"],
+        "error": result["error"],
+        "error_code": result["error_code"],
+        "conflicts": result["conflicts"],
+        "assembly": result["assembly"],
+    }
+    if result["ok"]:
+        body["final_version_preview"] = base_version + 1
+    return body
+
+
+@app.post("/api/rehearsal/preview")
+def rehearsal_preview(payload: RehearsalIn):
+    """有序试拼预演：从当前版本快照逐步推演，返回每步结果、最终位姿与分组，
+    或首个失败原因。只读，绝不修改真实数据。版本过期返回 409。"""
+    d = get_db()
+    if not payload.steps:
+        raise HTTPException(400, "试拼序列不能为空：至少需要一步撤销或建立关系")
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        snapshot = d.assembly_state()
+    return _rehearsal_body(snapshot, _steps_payload(payload),
+                           payload.expected_version)
+
+
+@app.post("/api/rehearsal/commit")
+def rehearsal_commit(payload: RehearsalIn):
+    """按同一版本与同一操作序列整体确认。
+
+    先在快照上完整推演（任一步失败 → 400/404，不写入）；再在事务内于真实库
+    重放：版本过期或重放失败一律回滚；全部成功仅递增一次装配版本。
+    """
+    d = get_db()
+    if not payload.steps:
+        raise HTTPException(400, "试拼序列不能为空：至少需要一步撤销或建立关系")
+    steps = _steps_payload(payload)
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+
+            # 1) 快照预演：任一步失败则整体不写入
+            preview = run_rehearsal(d.assembly_state(), steps)
+            if not preview["ok"]:
+                status = _step_http_status(preview["error_code"])
+                raise HTTPException(status, detail={
+                    "message": "试拼确认被拒绝，未写入任何变化",
+                    "failed_at": preview["failed_at"],
+                    "error": preview["error"],
+                    "conflicts": preview["conflicts"],
+                })
+
+            # 2) 真实库重放同一序列（同一演算保证结果一致）
+            for i, step in enumerate(steps):
+                if step["action"] == "undo":
+                    rid = step["relation_id"]
+                    rel = d.get_relation(rid)
+                    if rel is None:
+                        raise HTTPException(404, detail={
+                            "message": "试拼确认被拒绝，未写入任何变化",
+                            "failed_at": i,
+                            "error": f"第 {i + 1} 步失败：拼接关系 #{rid} 不存在",
+                        })
+                    if not rel["active"]:
+                        raise HTTPException(400, detail={
+                            "message": "试拼确认被拒绝，未写入任何变化",
+                            "failed_at": i,
+                            "error": f"第 {i + 1} 步失败：重复撤销，"
+                                     f"拼接关系 #{rid} 已撤销，不能再次撤销",
+                        })
+                    d.undo_relation(rid)
+                else:
+                    fa, fb = _load_pair(d, step["fragment_a"], step["fragment_b"])
+                    ev = evaluate_proposal(d, fa, fb,
+                                           step["markers_a"], step["markers_b"])
+                    if not ev["ok"]:
+                        raise HTTPException(400, detail={
+                            "message": "试拼确认被拒绝，未写入任何变化",
+                            "failed_at": i,
+                            "conflicts": ev["conflicts"]})
+                    for fid, pose in ev["new_poses"].items():
+                        d.update_pose(fid, pose)
+                    d.insert_relation(fa["id"], fb["id"], ev["markers"][0],
+                                      ev["markers"][1], max(ev["errors"]))
+                d.recompute_groups()
+
+            # 3) 全部成功：仅递增一次版本
+            new_version = d.bump_version()
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次试拼未生效")
+    return {"ok": True, "committed_steps": len(steps), "version": new_version,
+            "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 前端静态页

@@ -7,10 +7,15 @@ const S = {
   fragments: [],
   groups: [],
   relations: [],
-  mode: 'view',                       // view | draw | relate
+  mode: 'view',                       // view | draw | relate | rehearse
   cam: { scale: 6, ox: 0, oy: 0 },    // 像素/毫米 + 原点偏移
   draw: { name: '', points: [] },
   relate: { aId: null, bId: null, markersA: [], markersB: [], preview: null },
+  rehearse: {
+    steps: [],                        // {action, relation_id|fragment_a,...}
+    result: null,                     // /api/rehearsal/preview 响应
+    editor: null,                     // 正在编辑的步骤序号（null=追加新步）
+  },
   camInit: false,
 };
 
@@ -65,6 +70,7 @@ async function loadAssembly() {
 
 function handleConflict(err) {
   setMessage(detailText(err.detail), 'err');
+  if (S.mode === 'rehearse') { S.rehearse.result = null; S.rehearse.editor = null; }
   loadAssembly();   // 版本冲突：刷新到最新状态
 }
 
@@ -77,6 +83,16 @@ function applyPose(p, f) {
   return [c * p[0] - s * p[1] + f.x, s * p[0] + c * p[1] + f.y];
 }
 const worldContour = f => f.contour.map(p => applyPose(p, f));
+
+function drawRelationsMarkers(rels, byId) {
+  for (const r of rels) {
+    const fa = byId[r.fragment_a], fb = byId[r.fragment_b];
+    if (!fa || !fb) continue;
+    r.markers_a.forEach((m, i) => {
+      drawMarkerPair(applyPose(m, fa), applyPose(r.markers_b[i], fb), i);
+    });
+  }
+}
 
 function centroid(pts) {
   let x = 0, y = 0;
@@ -175,6 +191,36 @@ function renderMain() {
   ctx.clearRect(0, 0, w, h);
   drawGrid(w, h);
 
+  // 试拼编排预演：成功 → 叠加展示推演终态；失败 → 展示冲突步的放置
+  if (S.mode === 'rehearse') {
+    const R = S.rehearse;
+    if (R.result && R.result.ok) {
+      const sim = {};
+      for (const f of R.result.assembly.fragments) {
+        const color = f.group_id == null ? '#a89f93'
+          : PALETTE[f.group_id % PALETTE.length];
+        drawFragment({ id: f.id, name: f.name, group_id: f.group_id, contour: [] },
+          { contour: worldContour(f), color, highlight: true, name: f.name });
+        sim[f.id] = f;
+      }
+      drawRelationsMarkers(R.result.assembly.relations.filter(r => r.active), sim);
+      return;
+    }
+    if (R.result && R.result.failed_at != null) {
+      for (const f of S.fragments) drawFragment(f, { faint: true });
+      const failed = R.result.steps[R.result.failed_at];
+      if (failed && failed.placements && failed.placements.length) {
+        for (const pl of failed.placements) {
+          drawFragment({ id: pl.fragment_id, name: pl.name, group_id: 1, contour: [] },
+            { contour: pl.contour_world, highlight: true, color: '#c0392b', name: pl.name });
+        }
+      }
+      return;
+    }
+    for (const f of S.fragments) drawFragment(f);
+    return;
+  }
+
   const pv = S.mode === 'relate' ? S.relate.preview : null;
   const pvIds = pv ? new Set(pv.placements.map(p => p.fragment_id)) : new Set();
 
@@ -198,16 +244,10 @@ function renderMain() {
     }
   }
 
-  // 已有关系的标记（查看模式）
+  // 已有关系的标记（查看模式 / 试拼终态）
   if (S.mode === 'view') {
-    const byId = Object.fromEntries(S.fragments.map(f => [f.id, f]));
-    for (const r of S.relations.filter(r => r.active)) {
-      const fa = byId[r.fragment_a], fb = byId[r.fragment_b];
-      if (!fa || !fb) continue;
-      r.markers_a.forEach((m, i) => {
-        drawMarkerPair(applyPose(m, fa), applyPose(r.markers_b[i], fb), i);
-      });
-    }
+    drawRelationsMarkers(S.relations.filter(r => r.active),
+      Object.fromEntries(S.fragments.map(f => [f.id, f])));
   }
 
   // 录入中的多边形
@@ -238,13 +278,16 @@ function renderPanel() {
   const el = $('#panel');
   if (S.mode === 'view') el.innerHTML = viewPanelHTML();
   else if (S.mode === 'draw') el.innerHTML = drawPanelHTML();
+  else if (S.mode === 'rehearse') el.innerHTML = rehearsePanelHTML();
   else el.innerHTML = relatePanelHTML();
   bindPanelEvents();
   if (S.mode === 'relate') drawMinis();
+  if (S.mode === 'rehearse') drawRehearseMinis();
   $('#hint').textContent = {
     view: '拖拽平移 · 滚轮缩放 · 单位：毫米',
     draw: '单击画布添加顶点（≥3 个）· 拖拽平移 · 滚轮缩放 · 保存时自动闭合',
     relate: '在左侧两个小图中点击轮廓边缘放置对应标记（每片 ≥2 处、数量一致），然后预览/采纳',
+    rehearse: '编排非空有序操作序列：撤销现存关系或以两片陶片+成对标记建立关系；预演不落库，确认整体提交',
   }[S.mode];
 }
 
@@ -346,6 +389,119 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// ------------------------------------------------------------ 试拼编排面板
+function rehearseStepHTML(st, i) {
+  const R = S.rehearse;
+  let head, body = '';
+  if (st.action === 'undo') {
+    const r = S.relations.find(x => x.id === st.relation_id);
+    const name = r
+      ? `${esc(fragById(r.fragment_a)?.name || r.fragment_a)} ↔ ${esc(fragById(r.fragment_b)?.name || r.fragment_b)}`
+      : `#${st.relation_id}`;
+    head = `撤销关系 #${st.relation_id}（${name}）`;
+  } else {
+    head = `建立关系：#${st.fragment_a} ↔ #${st.fragment_b}（${st.markers_a.length} 对标记）`;
+  }
+  if (R.result && R.result.steps[i]) {
+    const sr = R.result.steps[i];
+    if (sr.ok) {
+      if (sr.action === 'create') {
+        const tn = { new_group: '新建组', join: '加入组', merge: '合并组', loop: '闭环' }[sr.relation_type] || '';
+        body = `<div class="sub">✓ ${tn} · 最大误差 ${fmt(sr.max_error_mm ?? 0, 3)} mm · 步后分组 ${groupsText(sr.groups)}</div>`;
+      } else {
+        body = `<div class="sub">✓ 已撤销 · 步后分组 ${groupsText(sr.groups)}</div>`;
+      }
+    } else {
+      body = `<div class="sub" style="color:#a02020">✗ ${esc((sr.conflicts || []).join('；') || '失败')}</div>`;
+    }
+  }
+  const failed = R.result && R.result.failed_at === i ? ' failed' : '';
+  return `
+    <div class="card step${failed}">
+      <div class="row">
+        <span class="stepno">${i + 1}</span>
+        <span style="flex:1">${head}</span>
+        <button class="act" data-rh-edit="${i}">编辑</button>
+        <button class="act danger" data-rh-del="${i}">删除</button>
+      </div>${body}
+    </div>`;
+}
+
+function groupsText(groups) {
+  if (!groups || !groups.length) return '全部孤片';
+  return groups.map(g => `{${g.fragment_ids.join(',')}}`).join(' ');
+}
+
+function rehearseComposerHTML() {
+  const R = S.rehearse;
+  const cp = R.cp;
+  const opts = sel => S.fragments.map(f =>
+    `<option value="${f.id}" ${f.id === sel ? 'selected' : ''}>#${f.id} ${esc(f.name)}</option>`).join('');
+  const undoOpts = S.relations.filter(r => r.active).map(r =>
+    `<option value="${r.id}" ${r.id === cp.undoId ? 'selected' : ''}>#${r.id} ${esc(fragById(r.fragment_a)?.name || r.fragment_a)} ↔ ${esc(fragById(r.fragment_b)?.name || r.fragment_b)}</option>`).join('');
+  return `
+    <h2>添加步骤（${R.editor == null ? '追加到序列末尾' : `编辑第 ${R.editor + 1} 步`}）</h2>
+    <div class="row">
+      <button class="act ${cp.kind === 'undo' ? 'primary' : ''}" data-rh-kind="undo">撤销关系</button>
+      <button class="act ${cp.kind === 'create' ? 'primary' : ''}" data-rh-kind="create">建立关系</button>
+    </div>
+    ${cp.kind === 'undo' ? `
+      <label class="lab">现存有效关系</label>
+      <select id="rhUndo">${undoOpts || '<option value="">（暂无有效关系）</option>'}</select>
+    ` : `
+      <label class="lab">碎片甲</label><select id="rhA">${opts(cp.aId)}</select>
+      <canvas class="mini" id="rhMiniA"></canvas>
+      <div class="row"><span class="small">标记 ${cp.markersA.length} 处</span><span class="spacer"></span>
+        <button class="act" id="rhUndoA" ${cp.markersA.length ? '' : 'disabled'}>撤销标记</button></div>
+      <label class="lab">碎片乙</label><select id="rhB">${opts(cp.bId)}</select>
+      <canvas class="mini" id="rhMiniB"></canvas>
+      <div class="row"><span class="small">标记 ${cp.markersB.length} 处</span><span class="spacer"></span>
+        <button class="act" id="rhUndoB" ${cp.markersB.length ? '' : 'disabled'}>撤销标记</button></div>
+    `}
+    <div class="row" style="margin-top:8px">
+      <button class="act primary" id="rhApplyStep">${R.editor == null ? '加入序列' : '保存修改'}</button>
+      ${R.editor != null ? '<button class="act" id="rhCancelEdit">取消编辑</button>' : ''}
+    </div>`;
+}
+
+function rehearseFinalHTML() {
+  const R = S.rehearse;
+  const res = R.result;
+  if (!res) return '';
+  if (!res.ok) {
+    return `
+      <h2>试拼结果</h2>
+      <div class="conflicts"><b>第 ${res.failed_at + 1} 步失败，推演已停止（不落库）：</b>
+        <div style="margin-top:4px">${esc(res.error)}</div></div>`;
+  }
+  const rows = res.assembly.fragments.map(f =>
+    `<tr><td>${esc(f.name)}</td><td>${f.group_id == null ? '孤片' : 'G' + f.group_id}</td>
+     <td>${fmt(f.x)}</td><td>${fmt(f.y)}</td><td>${deg(f.theta)}°</td></tr>`).join('');
+  return `
+    <h2>试拼结果（${res.steps.length} 步全部通过）</h2>
+    <div class="okbox">✓ 预演只读，数据未修改。确认后按当前版本 v${res.base_version}
+      整体提交，成功仅递增至 v${res.final_version_preview}。</div>
+    <table class="info"><tr><th>碎片</th><th>分组</th><th>x</th><th>y</th><th>角度</th></tr>${rows}</table>
+    <div class="row"><button class="act primary" id="rhCommit">确认整段试拼（${res.steps.length} 步）</button></div>`;
+}
+
+function rehearsePanelHTML() {
+  const R = S.rehearse;
+  const cards = R.steps.map((st, i) => rehearseStepHTML(st, i)).join('')
+    || '<div class="small">序列为空：在下方添加第一步（撤销或建立关系）。</div>';
+  return `
+    <h2>试拼编排（基于 v${S.version}）</h2>
+    <div class="row">
+      <button class="act primary" id="rhPreview" ${R.steps.length ? '' : 'disabled'}>预 演</button>
+      <button class="act" id="rhClear" ${R.steps.length ? '' : 'disabled'}>清空序列</button>
+    </div>
+    <h2>有序步骤（${R.steps.length}）</h2>${cards}
+    ${rehearseComposerHTML()}
+    ${rehearseFinalHTML()}`;
+}
+
+// ------------------------------------------------------------ 试拼面板事件
+
 // ---------------------------------------------------------------- 面板事件
 function bindPanelEvents() {
   document.querySelectorAll('[data-del-frag]').forEach(b => b.onclick = () => deleteFragment(+b.dataset.delFrag));
@@ -379,6 +535,8 @@ function bindPanelEvents() {
     bindMini($('#miniA'), 'A');
     bindMini($('#miniB'), 'B');
   }
+
+  if (S.mode === 'rehearse') bindRehearseEvents();
 }
 
 // ---------------------------------------------------------------- 业务动作
@@ -476,6 +634,137 @@ function applyAssembly(a) {
   renderPanel(); renderMain();
 }
 
+// ---------------------------------------------------------------- 试拼编排
+function defaultCreateComposer() {
+  return {
+    kind: 'create',
+    aId: S.fragments[0]?.id ?? null,
+    bId: S.fragments[1]?.id ?? null,
+    markersA: [], markersB: [],
+  };
+}
+
+function resetComposer(kind = 'create') {
+  const R = S.rehearse;
+  const undoId = S.relations.find(r => r.active)?.id ?? null;
+  R.cp = { ...defaultCreateComposer(), kind, undoId };
+}
+
+function bindRehearseEvents() {
+  const R = S.rehearse;
+  if (!R.cp) resetComposer();
+
+  document.querySelectorAll('[data-rh-del]').forEach(b => b.onclick = () => {
+    R.steps.splice(+b.dataset.rhDel, 1);
+    R.result = null;
+    if (R.editor === +b.dataset.rhDel) R.editor = null;
+    renderPanel(); renderMain();
+  });
+  document.querySelectorAll('[data-rh-edit]').forEach(b => b.onclick = () => {
+    const i = +b.dataset.rhEdit;
+    const st = R.steps[i];
+    R.editor = i;
+    if (st.action === 'undo') R.cp = { ...defaultCreateComposer(), kind: 'undo', undoId: st.relation_id };
+    else R.cp = { kind: 'create', aId: st.fragment_a, bId: st.fragment_b,
+                  markersA: st.markers_a.map(p => [...p]), markersB: st.markers_b.map(p => [...p]) };
+    renderPanel();
+  });
+  document.querySelectorAll('[data-rh-kind]').forEach(b => b.onclick = () => {
+    resetComposer(b.dataset.rhKind);
+    renderPanel();
+  });
+
+  $('#rhClear').onclick = () => {
+    R.steps = []; R.result = null; R.editor = null;
+    resetComposer();
+    renderPanel(); renderMain();
+  };
+  $('#rhPreview').onclick = doRehearsePreview;
+
+  const cp = R.cp;
+  if (cp.kind === 'undo') {
+    $('#rhUndo').onchange = e => { cp.undoId = +e.target.value; };
+  } else {
+    $('#rhA').onchange = e => { cp.aId = +e.target.value; cp.markersA = []; renderPanel(); };
+    $('#rhB').onchange = e => { cp.bId = +e.target.value; cp.markersB = []; renderPanel(); };
+    $('#rhUndoA').onclick = () => { cp.markersA.pop(); renderPanel(); };
+    $('#rhUndoB').onclick = () => { cp.markersB.pop(); renderPanel(); };
+    bindMiniCanvas($('#rhMiniA'), 'A', cp, () => fragById(cp.aId),
+      () => { renderPanel(); renderMain(); });
+    bindMiniCanvas($('#rhMiniB'), 'B', cp, () => fragById(cp.bId),
+      () => { renderPanel(); renderMain(); });
+  }
+
+  $('#rhApplyStep').onclick = () => {
+    let step;
+    if (cp.kind === 'undo') {
+      if (cp.undoId == null) return setMessage('当前没有可撤销的有效关系', 'err');
+      step = { action: 'undo', relation_id: cp.undoId };
+    } else {
+      if (cp.aId === cp.bId) return setMessage('不能与同一片陶片建立关系', 'err');
+      if (cp.markersA.length < 2 || cp.markersA.length !== cp.markersB.length)
+        return setMessage('每片需 ≥2 处标记且数量一致', 'err');
+      step = { action: 'create', fragment_a: cp.aId, fragment_b: cp.bId,
+               markers_a: cp.markersA, markers_b: cp.markersB };
+    }
+    if (R.editor == null) R.steps.push(step);
+    else R.steps[R.editor] = step;
+    R.editor = null;
+    R.result = null;
+    resetComposer();
+    renderPanel(); renderMain();
+  };
+  const cancel = $('#rhCancelEdit');
+  if (cancel) cancel.onclick = () => { R.editor = null; resetComposer(); renderPanel(); };
+
+  const commitBtn = $('#rhCommit');
+  if (commitBtn) commitBtn.onclick = doRehearseCommit;
+}
+
+async function doRehearsePreview() {
+  const R = S.rehearse;
+  try {
+    R.result = await api('/api/rehearsal/preview', {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version, steps: R.steps }),
+    });
+    renderPanel(); renderMain();
+    if (R.result.ok) setMessage(`试拼预演通过：共 ${R.result.steps.length} 步（只读，未落库）`);
+    else setMessage(R.result.error, 'err');
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+async function doRehearseCommit() {
+  const R = S.rehearse;
+  if (!confirm(`确认按 v${S.version} 整体提交这 ${R.steps.length} 步试拼？`
+      + '\n任一步失败或版本过期均不会写入；成功后版本仅递增一次。')) return;
+  try {
+    const res = await api('/api/rehearsal/commit', {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version, steps: R.steps }),
+    });
+    setMessage(`试拼已整体确认（${res.committed_steps} 步），版本升至 v${res.version}`);
+    R.steps = []; R.result = null; R.editor = null;
+    applyAssembly(res.assembly);
+    switchMode('view');
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    const d = err.detail || {};
+    if (d.failed_at != null) {
+      R.result = {
+        ok: false, failed_at: d.failed_at,
+        error: d.error || detailText(d), conflicts: d.conflicts || [],
+        steps: R.result?.steps || [],
+      };
+      renderPanel(); renderMain();
+    }
+    setMessage(detailText(d), 'err');
+  }
+}
+
 // ---------------------------------------------------------------- 小图（局部坐标 + 标记捕捉）
 function fitTransform(contour, w, h, margin = 18) {
   const xs = contour.map(p => p[0]), ys = contour.map(p => p[1]);
@@ -543,19 +832,31 @@ function drawMinis() {
 }
 
 function bindMini(cv, side) {
+  bindMiniCanvas(cv, side === 'A' ? 'A' : 'B', S.relate,
+    fragById(side === 'A' ? S.relate.aId : S.relate.bId),
+    () => { S.relate.preview = null; renderPanel(); renderMain(); });
+}
+
+function bindMiniCanvas(cv, side, store, getFrag, onChange) {
   cv.onclick = e => {
-    const R = S.relate;
-    const frag = fragById(side === 'A' ? R.aId : R.bId);
+    const frag = getFrag();
     const t = cv._t;
     if (!frag || !t) return;
     const rect = cv.getBoundingClientRect();
     const px = e.clientX - rect.left, py = e.clientY - rect.top;
     const local = [(px - t.ox) / t.s, -(py - t.oy) / t.s];
     const snapped = snapToContour(local, frag.contour);   // 边缘标记：吸附到轮廓
-    (side === 'A' ? R.markersA : R.markersB).push(snapped);
-    R.preview = null;
-    renderPanel(); renderMain();
+    (side === 'A' ? store.markersA : store.markersB).push(snapped);
+    onChange();
   };
+}
+
+function drawRehearseMinis() {
+  const R = S.rehearse;
+  if (R.cp.kind !== 'create') return;
+  const tA = drawMini($('#rhMiniA'), fragById(R.cp.aId), R.cp.markersA);
+  const tB = drawMini($('#rhMiniB'), fragById(R.cp.bId), R.cp.markersB);
+  $('#rhMiniA')._t = tA; $('#rhMiniB')._t = tB;
 }
 
 // ---------------------------------------------------------------- 主画布交互
@@ -601,6 +902,7 @@ function switchMode(mode) {
     S.relate.aId = S.fragments[0].id;
     S.relate.bId = S.fragments[1].id;
   }
+  if (mode === 'rehearse' && !S.rehearse.cp) resetComposer('create');
   renderPanel(); renderMain();
 }
 document.querySelectorAll('.mode-btn').forEach(b =>

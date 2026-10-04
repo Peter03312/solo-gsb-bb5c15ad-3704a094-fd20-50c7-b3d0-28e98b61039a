@@ -46,6 +46,40 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def compute_groups(fragment_ids, active_pairs) -> dict:
+    """按有效关系边计算连通分量，返回 {fragment_id: group_id|None}。
+
+    组 id 取组内最小碎片 id；孤片（无任何有效关系）为 None。
+    纯函数：真实库重算与试拼内存推演共用同一套分组规则。
+    """
+    parent = {i: i for i in fragment_ids}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for a, b in active_pairs:
+        if a in parent and b in parent:
+            union(a, b)
+
+    comps: dict[int, list[int]] = {}
+    for i in fragment_ids:
+        comps.setdefault(find(i), []).append(i)
+    gid_of: dict[int, int | None] = {}
+    for members in comps.values():
+        gid = min(members) if len(members) > 1 else None
+        for m in members:
+            gid_of[m] = gid
+    return gid_of
+
+
 class DB:
     def __init__(self, path: str):
         self.path = path
@@ -168,34 +202,16 @@ class DB:
 
         只改组归属，不改任何位姿 —— 剩余组内相对位姿保持不变。
         """
-        ids = [r["id"] for r in self.conn.execute("SELECT id FROM fragments")]
-        parent = {i: i for i in ids}
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-
-        for r in self.conn.execute(
-                "SELECT fragment_a, fragment_b FROM relations WHERE active = 1"):
-            a, b = r["fragment_a"], r["fragment_b"]
-            if a in parent and b in parent:
-                union(a, b)
-
-        comps: dict[int, list[int]] = {}
-        for i in ids:
-            comps.setdefault(find(i), []).append(i)
-        for members in comps.values():
-            gid = min(members) if len(members) > 1 else None
-            for m in members:
-                self.conn.execute(
-                    "UPDATE fragments SET group_id = ? WHERE id = ?", (gid, m))
+        rows = self.conn.execute(
+            "SELECT fragment_a, fragment_b FROM relations WHERE active = 1"
+        ).fetchall()
+        active_pairs = [(r["fragment_a"], r["fragment_b"]) for r in rows]
+        gid_of = compute_groups(
+            [r["id"] for r in self.conn.execute("SELECT id FROM fragments")],
+            active_pairs)
+        for fid, gid in gid_of.items():
+            self.conn.execute(
+                "UPDATE fragments SET group_id = ? WHERE id = ?", (gid, fid))
 
     # ------------------------------------------------------------ 快照
 
