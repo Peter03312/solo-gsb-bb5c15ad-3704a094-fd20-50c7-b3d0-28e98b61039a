@@ -8,20 +8,25 @@
 - 同组内新增关系（闭环）必须符合已有位姿；
 - 任何校验失败整次拒绝，原拼接组不变；
 - 撤销关系后按剩余关系重算连通组，孤片恢复独立状态；
-- 采纳/撤销携带期望版本号，过期版本返回 409 冲突。
+- 采纳/撤销携带期望版本号，过期版本返回 409 冲突；
+- 有序试拼（/api/trials/rehearse）基于版本快照逐步推演，不落库；
+  确认（/api/trials/commit）整体提交，任一步失败或版本过期均不写入，
+  成功仅递增一次装配版本（详见 trial.py）。
 """
 from __future__ import annotations
 
 import math
 import os
 from contextlib import asynccontextmanager
+from typing import Literal, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry
+from . import geometry, trial
 from .database import DB
+from .trial import TrialError, evaluate_proposal
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get(
@@ -58,11 +63,31 @@ class UndoIn(BaseModel):
     expected_version: int
 
 
+class TrialRelateStep(BaseModel):
+    action: Literal["relate"] = "relate"
+    fragment_a: int
+    fragment_b: int
+    markers_a: list[list[float]] = Field(default_factory=list)
+    markers_b: list[list[float]] = Field(default_factory=list)
+    # 可选：供序列内后续撤销步引用本步新建的关系
+    client_id: str | None = Field(default=None, max_length=100)
+
+
+class TrialUndoStep(BaseModel):
+    action: Literal["undo"] = "undo"
+    relation_id: int | None = None       # 撤销已存在的有效关系
+    client_id: str | None = None         # 或撤销序列内前序新建关系
+
+
+TrialStep = Union[TrialRelateStep, TrialUndoStep]
+
+
+class TrialIn(BaseModel):
+    expected_version: int
+    steps: list[TrialStep] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 拼接演算
-
-def _pose_of(f: dict) -> tuple[float, float, float]:
-    return (f["x"], f["y"], f["theta"])
-
 
 def _load_pair(d: DB, fa_id: int, fb_id: int):
     if fa_id == fb_id:
@@ -74,86 +99,7 @@ def _load_pair(d: DB, fa_id: int, fb_id: int):
     return fa, fb
 
 
-def _members(d: DB, frag: dict) -> list[dict]:
-    """碎片所在组的全部成员（孤片即自身）。"""
-    if frag["group_id"] is None:
-        return [frag]
-    return d.group_members(frag["group_id"])
-
-
-def evaluate_proposal(d: DB, fa: dict, fb: dict,
-                      markers_a, markers_b) -> dict:
-    """计算采纳后的位姿方案（只读，不落库），供预览与采纳共用。"""
-    try:
-        ma, mb = geometry.validate_markers(markers_a, markers_b)
-    except geometry.GeometryError as e:
-        return {"ok": False, "relation_type": None, "conflicts": [str(e)],
-                "errors": [], "poses": {}, "new_poses": {}, "involved": [],
-                "markers": (markers_a, markers_b)}
-
-    members_a, members_b = _members(d, fa), _members(d, fb)
-    ga, gb = fa["group_id"], fb["group_id"]
-    pose_a, pose_b = _pose_of(fa), _pose_of(fb)
-    new_poses: dict[int, tuple] = {}
-
-    if ga is not None and ga == gb:
-        # 闭环关系：必须符合已有位姿，不移动任何碎片
-        relation_type = "loop"
-        involved = {f["id"] for f in members_a}
-    else:
-        dst = [geometry.apply_pose(m, pose_a) for m in ma]  # A 侧标记的世界坐标
-        if ga is None and gb is None:
-            relation_type = "new_group"
-            new_poses[fb["id"]] = geometry.fit_rigid(mb, dst)
-        elif ga is not None and gb is None:
-            relation_type = "join"
-            new_poses[fb["id"]] = geometry.fit_rigid(mb, dst)
-        elif ga is None and gb is not None:
-            relation_type = "join"
-            src_b = [geometry.apply_pose(m, pose_b) for m in mb]
-            new_poses[fa["id"]] = geometry.fit_rigid(ma, src_b)
-        else:
-            # 合并两组：整体移动 B 组，组内相对位姿不变
-            relation_type = "merge"
-            src_b = [geometry.apply_pose(m, pose_b) for m in mb]
-            T = geometry.fit_rigid(src_b, dst)
-            for f in members_b:
-                new_poses[f["id"]] = geometry.compose_pose(T, _pose_of(f))
-        involved = {f["id"] for f in members_a} | {f["id"] for f in members_b}
-
-    # 采纳后的最终位姿 = 当前位姿 + 本次改动
-    by_id = {f["id"]: f for f in members_a + members_b}
-    poses = {fid: _pose_of(f) for fid, f in by_id.items()}
-    poses.update(new_poses)
-
-    conflicts: list[str] = []
-    errors = geometry.pair_errors(ma, mb, poses[fa["id"]], poses[fb["id"]])
-    for i, e in enumerate(errors):
-        if e > geometry.MAX_ERROR_MM + 1e-9:
-            conflicts.append(
-                f"误差超限：第 {i + 1} 对对应点误差 {e:.3f} mm，"
-                f"超过 {geometry.MAX_ERROR_MM:.0f} mm 限值")
-
-    placed = [
-        (fid, by_id[fid]["name"],
-         geometry.contour_world(by_id[fid]["contour"], poses[fid]))
-        for fid in sorted(involved)
-    ]
-    for n1, n2, area in geometry.find_overlaps(placed):
-        conflicts.append(
-            f"碰撞：碎片「{n1}」与「{n2}」轮廓内部重叠 {area:.2f} mm²")
-
-    return {
-        "ok": not conflicts,
-        "relation_type": relation_type,
-        "conflicts": conflicts,
-        "errors": errors,
-        "poses": poses,
-        "new_poses": new_poses,
-        "involved": sorted(involved),
-        "by_id": by_id,
-        "markers": (ma, mb),
-    }
+# 位姿方案演算 evaluate_proposal 位于 trial.py，单条预览/采纳与试拼共用。
 
 
 def _check_version(d: DB, expected: int):
@@ -345,6 +291,73 @@ def list_relations():
 def get_assembly():
     """当前装配快照：版本号、碎片位姿、连通组、全部关系。"""
     return get_db().assembly_state()
+
+
+# ---------------------------------------------------------------- 有序试拼
+
+def _rehearse_response(sim: dict) -> dict:
+    """把推演结果整理成 /trials/rehearse 响应（不含内部 actions）。"""
+    return {
+        "ok": sim["ok"],
+        "base_version": sim["base_version"],
+        "steps": sim["steps"],
+        "failed_at": sim["failed_at"],
+        "failure": sim["failure"],
+        "assembly": sim["assembly"],
+    }
+
+
+@app.post("/api/trials/rehearse")
+def rehearse_trial(payload: TrialIn):
+    """试拼预演：基于 expected_version 快照逐步推演，不改数据。
+
+    返回每步结果（位姿/误差/连通组）、失败步及失败原因，以及最终（或失败
+    前一刻）的位姿与分组。版本过期返回 409。
+    """
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        try:
+            sim = trial.simulate(d, payload.steps)
+        except TrialError as e:
+            raise HTTPException(e.status, e.detail())
+    return _rehearse_response(sim)
+
+
+@app.post("/api/trials/commit", status_code=201)
+def commit_trial(payload: TrialIn):
+    """确认试拼：同一版本 + 同一操作序列整体提交。
+
+    任一步失败或版本过期均不写入任何变化；全部成功仅递增一次装配版本。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            try:
+                sim = trial.simulate(d, payload.steps)
+            except TrialError as e:
+                raise HTTPException(e.status, e.detail())
+            if not sim["ok"]:
+                raise HTTPException(
+                    sim["failure"]["http_status"], detail={
+                        "message": "试拼序列存在失败步骤，未写入任何变化",
+                        "failed_at": sim["failed_at"],
+                        **{k: v for k, v in sim["failure"].items()
+                           if k != "http_status"},
+                    })
+            cid_map = trial.commit_actions(d, sim)
+            new_version = d.bump_version()
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "version": new_version, "committed_steps": len(sim["steps"]),
+            "relation_ids": cid_map, "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 前端静态页

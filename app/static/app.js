@@ -11,6 +11,7 @@ const S = {
   cam: { scale: 6, ox: 0, oy: 0 },    // 像素/毫米 + 原点偏移
   draw: { name: '', points: [] },
   relate: { aId: null, bId: null, markersA: [], markersB: [], preview: null },
+  trial: { steps: [], rehearsal: null, busy: false },
   camInit: false,
 };
 
@@ -58,6 +59,7 @@ async function loadAssembly() {
   S.fragments = data.fragments;
   S.groups = data.groups;
   S.relations = data.relations;
+  S.trial = { steps: [], rehearsal: null, busy: false };  // 刷新后旧试拼作废
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel();
   renderMain();
@@ -66,6 +68,84 @@ async function loadAssembly() {
 function handleConflict(err) {
   setMessage(detailText(err.detail), 'err');
   loadAssembly();   // 版本冲突：刷新到最新状态
+}
+
+// ---------------------------------------------------------------- 有序试拼
+function trialAssembly() {
+  const r = S.trial.rehearsal;
+  return r && r.ok ? r.assembly : null;   // 仅整体成功时在画布预演最终状态
+}
+
+function stepSummary(st) {
+  if (st.action === 'undo') {
+    if (st.client_id) return `撤销试拼关系「${esc(st.client_id)}」`;
+    const rel = S.relations.find(r => r.id === st.relation_id);
+    const name = rel
+      ? `${esc(fragById(rel.fragment_a)?.name || '?')} ↔ ${esc(fragById(rel.fragment_b)?.name || '?')}`
+      : `#${st.relation_id}`;
+    return `撤销关系 #${st.relation_id}（${name}）`;
+  }
+  const an = fragById(st.fragment_a)?.name || '?';
+  const bn = fragById(st.fragment_b)?.name || '?';
+  const cid = st.client_id ? ` <span class="sub">[${esc(st.client_id)}]</span>` : '';
+  return `建立关系 ${esc(an)} ↔ ${esc(bn)}${cid}`;
+}
+
+async function runRehearsal() {
+  const T = S.trial;
+  if (!T.steps.length) { T.rehearsal = null; return; }
+  T.busy = true;
+  try {
+    T.rehearsal = await api('/api/trials/rehearse', {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version, steps: T.steps }),
+    });
+  } catch (err) {
+    T.busy = false;
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+    T.rehearsal = null;
+    renderPanel(); renderMain();
+    return;
+  }
+  T.busy = false;
+  renderPanel(); renderMain();
+}
+
+function addTrialStep(step) {
+  S.trial.steps.push(step);
+  S.trial.rehearsal = null;
+  renderPanel(); renderMain();
+  runRehearsal();
+}
+
+function removeTrialStep(i) {
+  S.trial.steps.splice(i, 1);
+  S.trial.rehearsal = null;
+  if (!S.trial.steps.length) S.trial.rehearsal = null;
+  renderPanel(); renderMain();
+  if (S.trial.steps.length) runRehearsal();
+}
+
+function clearTrial() {
+  S.trial = { steps: [], rehearsal: null, busy: false };
+  renderPanel(); renderMain();
+}
+
+async function commitTrial() {
+  const T = S.trial;
+  try {
+    const res = await api('/api/trials/commit', {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version, steps: T.steps }),
+    });
+    setMessage(`试拼序列已整体确认（${res.committed_steps} 步），装配版本 v${res.version}`);
+    clearTrial();
+    applyAssembly(res.assembly);
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+  }
 }
 
 // ---------------------------------------------------------------- 坐标变换
@@ -153,19 +233,19 @@ function drawFragment(f, opts = {}) {
   ctx.globalAlpha = 1;
 }
 
-function drawMarkerPair(wa, wb, idx, errText) {
+function drawMarkerPair(wa, wb, idx, errText, color = '#c0392b') {
   const [ax, ay] = toScreen(wa[0], wa[1]);
   const [bx, by] = toScreen(wb[0], wb[1]);
   ctx.setLineDash([4, 3]);
-  ctx.strokeStyle = '#c0392b';
+  ctx.strokeStyle = color;
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
   ctx.setLineDash([]);
-  ctx.fillStyle = '#c0392b';
+  ctx.fillStyle = color;
   ctx.beginPath(); ctx.arc(ax, ay, 4, 0, 7); ctx.fill();
-  ctx.strokeStyle = '#c0392b';
+  ctx.strokeStyle = color;
   ctx.beginPath(); ctx.arc(bx, by, 4, 0, 7); ctx.stroke();
-  ctx.fillStyle = '#c0392b';
+  ctx.fillStyle = color;
   ctx.font = '10px sans-serif';
   ctx.fillText(`#${idx + 1}${errText || ''}`, (ax + bx) / 2 + 5, (ay + by) / 2 - 4);
 }
@@ -178,9 +258,15 @@ function renderMain() {
   const pv = S.mode === 'relate' ? S.relate.preview : null;
   const pvIds = pv ? new Set(pv.placements.map(p => p.fragment_id)) : new Set();
 
-  for (const f of S.fragments) {
+  // 有序试拼预演成功后：画布展示推演结果的最终位姿与分组
+  const ta = S.mode === 'view' ? trialAssembly() : null;
+  const viewFrags = ta ? ta.fragments : S.fragments;
+  const viewRels = ta ? ta.relations : S.relations;
+
+  for (const f of viewFrags) {
     if (pvIds.has(f.id)) continue;
-    drawFragment(f, { faint: S.mode === 'draw' });
+    drawFragment(f, { faint: S.mode === 'draw',
+      color: ta ? '#2e86c1' : groupColor(f.group_id) });
   }
 
   // 预览：仅平移+旋转后的组合
@@ -200,12 +286,14 @@ function renderMain() {
 
   // 已有关系的标记（查看模式）
   if (S.mode === 'view') {
-    const byId = Object.fromEntries(S.fragments.map(f => [f.id, f]));
-    for (const r of S.relations.filter(r => r.active)) {
+    const byId = Object.fromEntries(viewFrags.map(f => [f.id, f]));
+    for (const r of viewRels.filter(r => r.active)) {
       const fa = byId[r.fragment_a], fb = byId[r.fragment_b];
       if (!fa || !fb) continue;
+      const isTrialRel = r.id < 0;   // 序列内新建关系的临时 id 为负数
       r.markers_a.forEach((m, i) => {
-        drawMarkerPair(applyPose(m, fa), applyPose(r.markers_b[i], fb), i);
+        drawMarkerPair(applyPose(m, fa), applyPose(r.markers_b[i], fb), i,
+          '', isTrialRel ? '#2e86c1' : '#c0392b');
       });
     }
   }
@@ -242,9 +330,11 @@ function renderPanel() {
   bindPanelEvents();
   if (S.mode === 'relate') drawMinis();
   $('#hint').textContent = {
-    view: '拖拽平移 · 滚轮缩放 · 单位：毫米',
+    view: trialAssembly()
+      ? '有序试拼预演结果（蓝色，不落库）· 侧栏可确认整组提交 · 拖拽平移 · 滚轮缩放'
+      : '拖拽平移 · 滚轮缩放 · 单位：毫米',
     draw: '单击画布添加顶点（≥3 个）· 拖拽平移 · 滚轮缩放 · 保存时自动闭合',
-    relate: '在左侧两个小图中点击轮廓边缘放置对应标记（每片 ≥2 处、数量一致），然后预览/采纳',
+    relate: '在左侧两个小图中点击轮廓边缘放置对应标记（每片 ≥2 处、数量一致），然后预览/采纳/加入试拼',
   }[S.mode];
 }
 
@@ -266,6 +356,7 @@ function viewPanelHTML() {
       <div class="row">
         <span><b>#${r.id}</b> ${esc(fragById(r.fragment_a)?.name || '?')} ↔ ${esc(fragById(r.fragment_b)?.name || '?')}</span>
         <span class="spacer"></span>
+        <button class="act" data-trial-undo-rel="${r.id}">试拼撤销</button>
         <button class="act" data-undo="${r.id}">撤销</button>
       </div>
       <div class="sub">${r.markers_a.length} 对标记 · 最大误差 ${fmt(r.max_error, 3)} mm · ${r.created_at.slice(0, 19)}</div>
@@ -276,7 +367,56 @@ function viewPanelHTML() {
   return `
     <h2>碎片（${S.fragments.length}）</h2>${fragCards}
     <h2>拼接关系（${active.length}）</h2>${relCards}
-    ${undone ? `<h2>已撤销（${undone.length}）</h2>${undoneCards}` : ''}`;
+    ${undone ? `<h2>已撤销（${undone.length}）</h2>${undoneCards}` : ''}
+    ${trialPanelHTML()}`;
+}
+
+function trialPanelHTML() {
+  const T = S.trial;
+  const stepCards = T.steps.map((st, i) => `
+    <div class="card ${i === (T.rehearsal?.failed_at || 0) - 1 ? 'trial-fail' : ''}">
+      <div class="row">
+        <span class="mono">${i + 1}.</span>
+        <span class="spacer"></span>
+        <button class="act danger" data-trial-del="${i}">移除</button>
+      </div>
+      <div>${stepSummary(st)}</div>
+      ${T.rehearsal && T.rehearsal.steps[i]
+        ? (T.rehearsal.steps[i].ok ? '<div class="sub oktxt">✓ 可执行</div>'
+            : `<div class="sub errtxt">✗ ${T.rehearsal.steps[i].conflicts.map(esc).join('；')}</div>`)
+        : ''}
+    </div>`).join('');
+
+  let resultHTML = '';
+  if (T.steps.length) {
+    const r = T.rehearsal;
+    if (!r) {
+      resultHTML = `<div class="small">${T.busy ? '预演中…' : ''}</div>`;
+    } else if (r.ok) {
+      const rows = r.assembly.fragments.map(f =>
+        `<tr><td>${esc(f.name)}</td><td>${fmt(f.x)}</td><td>${fmt(f.y)}</td><td>${deg(f.theta)}°</td><td>${f.group_id == null ? '独立' : 'G' + f.group_id}</td></tr>`).join('');
+      const groups = r.assembly.groups.map(g =>
+        `G${g.id}: ${g.fragment_ids.join(', ')}`).join('；') || '（全部独立）';
+      resultHTML = `
+        <div class="okbox">✓ 预演通过：${r.steps.length} 步全部可执行，确认后版本仅递增一次（v${r.base_version} → v${r.base_version + 1}）。</div>
+        <div class="small"><b>最终连通组</b>：${esc(groups)}</div>
+        <table class="info"><tr><th>碎片</th><th>x</th><th>y</th><th>角度</th><th>分组</th></tr>${rows}</table>
+        <button class="act primary" id="btnTrialCommit">确认整组提交</button>`;
+    } else {
+      const f = r.failure;
+      resultHTML = `
+        <div class="conflicts"><b>第 ${f.step} 步失败（序列在此中止，确认不会写入任何变化）：</b>
+          <div>${esc(f.message)}</div>
+          ${f.conflicts && f.conflicts.length ? `<ul>${f.conflicts.map(c => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+        </div>`;
+    }
+  }
+
+  return `
+    <h2>有序试拼（${T.steps.length} 步）</h2>
+    ${stepCards || '<div class="small">在「新建拼接」中编排“建立关系”，或点关系旁的「试拼撤销」加入撤销步。预演不落库。</div>'}
+    ${T.steps.length ? '<div class="row" style="margin:6px 0"><button class="act danger" id="btnTrialClear">清空序列</button></div>' : ''}
+    ${resultHTML}`;
 }
 
 function drawPanelHTML() {
@@ -335,9 +475,10 @@ function relatePanelHTML() {
     <div class="row" style="margin-top:10px">
       <button class="act" id="btnPreview" ${canAct ? '' : 'disabled'}>预 览</button>
       <button class="act primary" id="btnAccept" ${canAct ? '' : 'disabled'}>采 纳</button>
+      <button class="act" id="btnAddTrial" ${canAct ? '' : 'disabled'}>加入试拼</button>
       <button class="act" id="btnClearMarkers">清空标记</button>
     </div>
-    <div class="small" style="margin-top:4px">需每片 ≥2 处标记且数量一致；按序号一一对应。</div>
+    <div class="small" style="margin-top:4px">需每片 ≥2 处标记且数量一致；按序号一一对应。「加入试拼」只把该建立关系排入装配页的有序试拼序列，不落库。</div>
     ${pvHTML}`;
 }
 
@@ -350,6 +491,14 @@ function esc(s) {
 function bindPanelEvents() {
   document.querySelectorAll('[data-del-frag]').forEach(b => b.onclick = () => deleteFragment(+b.dataset.delFrag));
   document.querySelectorAll('[data-undo]').forEach(b => b.onclick = () => undoRelation(+b.dataset.undo));
+  document.querySelectorAll('[data-trial-undo-rel]').forEach(b =>
+    b.onclick = () => addTrialStep({ action: 'undo', relation_id: +b.dataset.trialUndoRel }));
+  document.querySelectorAll('[data-trial-del]').forEach(b =>
+    b.onclick = () => removeTrialStep(+b.dataset.trialDel));
+  const btnClear = document.getElementById('btnTrialClear');
+  if (btnClear) btnClear.onclick = clearTrial;
+  const btnCommit = document.getElementById('btnTrialCommit');
+  if (btnCommit) btnCommit.onclick = commitTrial;
 
   if (S.mode === 'draw') {
     $('#fragName').oninput = e => { S.draw.name = e.target.value; };
@@ -376,6 +525,7 @@ function bindPanelEvents() {
     $('#btnClearMarkers').onclick = () => { R.markersA = []; R.markersB = []; R.preview = null; renderPanel(); renderMain(); };
     $('#btnPreview').onclick = doPreview;
     $('#btnAccept').onclick = doAccept;
+    $('#btnAddTrial').onclick = addRelateToTrial;
     bindMini($('#miniA'), 'A');
     bindMini($('#miniB'), 'B');
   }
@@ -438,6 +588,21 @@ async function doAccept() {
     }
     setMessage(detailText(err.detail), 'err');
   }
+}
+
+function addRelateToTrial() {
+  const R = S.relate;
+  // 同序列内唯一 client_id，供后续撤销步引用本步新建的关系
+  const cid = `s${Date.now().toString(36)}${S.trial.steps.length}`;
+  addTrialStep({
+    action: 'relate',
+    fragment_a: R.aId, fragment_b: R.bId,
+    markers_a: R.markersA, markers_b: R.markersB,
+    client_id: cid,
+  });
+  R.markersA = []; R.markersB = []; R.preview = null;
+  setMessage('已把建立关系加入试拼序列，可在「查看装配」页确认');
+  switchMode('view');
 }
 
 async function undoRelation(rid) {
